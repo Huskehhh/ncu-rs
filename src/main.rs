@@ -95,13 +95,13 @@ async fn process_dependencies(
                                     "{package_name} {version} => {ver_prefix}{latest_version}"
                                 ));
                             }
-                            return None;
                         }
                         Err(err) => {
                             println!("Error when fetching {package_name} version, {err}");
-                            return None;
                         }
                     };
+
+                    None
                 })
             },
         )
