@@ -29,47 +29,8 @@ async fn main() -> Result<(), Error> {
     let deps = package_json.dependencies;
     let dev_deps = package_json.dev_dependencies;
 
-    let dep_futures: Vec<_> = deps
-        .iter()
-        .map(|(package_name, version)| {
-            let package_name = package_name.clone();
-            let version = version.clone();
-
-            tokio::spawn(async move {
-                let version = version.replace('^', "").replace('~', "");
-
-                match get_package_version(&package_name).await {
-                    Ok(latest_version) => {
-                        if latest_version != version {
-                            println!("{package_name} {version} => {latest_version}");
-                        }
-                    }
-                    Err(err) => println!("Error when fetching {package_name} version, {err}",),
-                }
-            })
-        })
-        .collect();
-
-    let dev_dep_futures: Vec<_> = dev_deps
-        .iter()
-        .map(|(package_name, version)| {
-            let package_name = package_name.clone();
-            let version = version.clone();
-
-            tokio::spawn(async move {
-                let version = version.replace('^', "").replace('~', "");
-
-                match get_package_version(&package_name).await {
-                    Ok(latest_version) => {
-                        if latest_version != version {
-                            println!("{package_name} {version} => {latest_version}");
-                        }
-                    }
-                    Err(err) => println!("Error when fetching {package_name} version, {err}",),
-                }
-            })
-        })
-        .collect();
+    let dep_futures = process_dependencies(deps).await;
+    let dev_dep_futures = process_dependencies(dev_deps).await;
 
     future::join_all(dep_futures).await;
     future::join_all(dev_dep_futures).await;
@@ -81,6 +42,38 @@ async fn main() -> Result<(), Error> {
     );
 
     Ok(())
+}
+
+async fn process_dependencies(deps: HashMap<String, String>) -> Vec<tokio::task::JoinHandle<()>> {
+    let futures: Vec<_> = deps
+        .iter()
+        .map(|(package_name, version)| {
+            let package_name = package_name.clone();
+            let version = version.clone();
+
+            tokio::spawn(async move {
+                let cmp_ver = version.replace('^', "").replace('~', "");
+                let ver_prefix = if version.contains('^') {
+                    "^"
+                } else if version.contains('~') {
+                    "~"
+                } else {
+                    ""
+                };
+
+                match get_package_version(&package_name).await {
+                    Ok(latest_version) => {
+                        if latest_version != cmp_ver {
+                            println!("{package_name} {version} => {ver_prefix}{latest_version}");
+                        }
+                    }
+                    Err(err) => println!("Error when fetching {package_name} version, {err}",),
+                }
+            })
+        })
+        .collect();
+
+    futures
 }
 
 async fn get_package_version(package_name: &str) -> Result<String, Error> {
