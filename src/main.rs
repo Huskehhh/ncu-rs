@@ -1,12 +1,14 @@
+use clap::{arg, command};
 use color_eyre::eyre::Error;
 use pbr::ProgressBar;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
 
-use std::{collections::HashMap, fs, time::Instant};
+use std::{collections::HashMap, fs, io::Stdout, time::Instant};
 
 const API_URL: &str = "https://registry.npmjs.org/";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct PackageJson {
     dependencies: HashMap<String, String>,
     #[serde(rename = "devDependencies")]
@@ -18,9 +20,30 @@ struct GetPackageResponse {
     version: String,
 }
 
+#[derive(Debug)]
+struct PackageUpdateData {
+    package_name: String,
+    old_version: String,
+    new_version: String,
+    _dev: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let package_file_contents = fs::read_to_string("package.json")?;
+    let matches = command!()
+        .arg(arg!([path] "Optional path to package.json"))
+        .arg(
+            arg!(
+                -u --update "Enables updating of dep versions in package.json"
+            )
+            .required(false),
+        )
+        .get_matches();
+
+    let path = matches.value_of("path").unwrap_or("package.json");
+    let _should_update = matches.is_present("update");
+
+    let package_file_contents = fs::read_to_string(&path)?;
     let package_json: PackageJson = serde_json::from_str(&package_file_contents)?;
 
     let start = Instant::now();
@@ -30,34 +53,24 @@ async fn main() -> Result<(), Error> {
 
     let dep_count = (deps.len() + dev_deps.len()) as u64;
 
-    let dep_futures = process_dependencies(deps).await;
-    let dev_dep_futures = process_dependencies(dev_deps).await;
+    let dep_futures = process_dependencies(deps, false).await;
+    let dev_dep_futures = process_dependencies(dev_deps, true).await;
 
     let mut updates = vec![];
-
     let mut pb = ProgressBar::new(dep_count);
+
     pb.show_speed = false;
     pb.show_time_left = false;
 
-    for future in dep_futures {
-        pb.inc();
-        let val = future.await?;
-        if let Some(update) = val {
-            updates.push(update);
-        }
-    }
+    await_futures(dep_futures, &mut pb, &mut updates).await?;
+    await_futures(dev_dep_futures, &mut pb, &mut updates).await?;
 
-    for future in dev_dep_futures {
-        pb.inc();
-        let val = future.await?;
-        if let Some(update) = val {
-            updates.push(update);
-        }
+    for update in updates {
+        println!(
+            "{}     {} => {}",
+            update.package_name, update.old_version, update.new_version
+        );
     }
-
-    updates.iter().for_each(|update| {
-        println!("{}", update);
-    });
 
     let end = Instant::now();
     println!(
@@ -68,13 +81,29 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
+async fn await_futures(
+    futures: Vec<JoinHandle<Option<PackageUpdateData>>>,
+    progress_bar: &mut ProgressBar<Stdout>,
+    updates_vec: &mut Vec<PackageUpdateData>,
+) -> Result<(), Error> {
+    for future in futures {
+        progress_bar.inc();
+        let val = future.await?;
+        if let Some(update) = val {
+            updates_vec.push(update);
+        }
+    }
+    Ok(())
+}
+
 async fn process_dependencies(
     deps: HashMap<String, String>,
-) -> Vec<tokio::task::JoinHandle<Option<String>>> {
+    dev: bool,
+) -> Vec<tokio::task::JoinHandle<Option<PackageUpdateData>>> {
     let futures: Vec<_> = deps
         .iter()
         .map(
-            |(package_name, version)| -> tokio::task::JoinHandle<Option<String>> {
+            |(package_name, version)| -> tokio::task::JoinHandle<Option<PackageUpdateData>> {
                 let package_name = package_name.clone();
                 let version = version.clone();
 
@@ -91,9 +120,14 @@ async fn process_dependencies(
                     match get_package_version(&package_name).await {
                         Ok(latest_version) => {
                             if latest_version != cmp_ver {
-                                return Some(format!(
-                                    "{package_name} {version} => {ver_prefix}{latest_version}"
-                                ));
+                                let package_update_data = PackageUpdateData {
+                                    package_name,
+                                    old_version: version,
+                                    new_version: format!("{}{}", ver_prefix, latest_version),
+                                    _dev: dev,
+                                };
+
+                                return Some(package_update_data);
                             }
                         }
                         Err(err) => {
