@@ -15,8 +15,6 @@ jobs:
     steps:
       - uses: actions/checkout@v2
       - uses: Swatinem/rust-cache@v1
-        with:
-          working-directory: .
       - uses: extractions/setup-just@v1
       - name: Install tarpaulin
         run: bash <(curl https://raw.githubusercontent.com/xd009642/tarpaulin/master/travis-install.sh)

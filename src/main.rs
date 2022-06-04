@@ -263,4 +263,39 @@ mod tests {
         let package_version = get_package_version(package).await;
         assert!(package_version.is_err());
     }
+
+    #[tokio::test]
+    async fn test_process_dependencies_and_await_futures() {
+        let mut deps: HashMap<String, String> = HashMap::new();
+        deps.insert("react".to_string(), "^2.0.0".to_string());
+        deps.insert("recoil".to_string(), "~3.0.0".to_string());
+
+        let futures = process_dependencies(&deps, false).await;
+        assert_eq!(futures.len(), 2);
+
+        let mut pb = ProgressBar::new(2);
+        pb.show_bar = false;
+        pb.show_counter = false;
+        pb.show_message = false;
+        pb.show_percent = false;
+        pb.show_time_left = false;
+        pb.show_speed = false;
+
+        let mut updates_vec: Vec<PackageUpdateData> = vec![];
+
+        let futures = await_futures(futures, &mut pb, &mut updates_vec).await;
+        assert!(futures.is_ok());
+
+        for update in updates_vec {
+            if update.package_name == "react" {
+                assert_eq!(update.old_version, "^2.0.0");
+                assert_ne!(update.old_version, update.new_version);
+            } else if update.package_name == "recoil" {
+                assert_eq!(update.old_version, "~3.0.0");
+                assert_ne!(update.old_version, update.new_version);
+            } else {
+                panic!("Unexpected package name: {}", update.package_name);
+            }
+        }
+    }
 }
