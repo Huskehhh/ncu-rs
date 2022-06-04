@@ -1,0 +1,33 @@
+name: Project CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-projects:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: Swatinem/rust-cache@v1
+        with:
+          working-directory: .
+      - uses: extractions/setup-just@v1
+      - name: Install tarpaulin
+        run: cargo install cargo-tarpaulin
+      - name: Build
+        run: just check
+      - name: Run tests
+        run: just test
+      - name: Generate coverage
+        run: just coverage
+      - name: Upload to codecov.io
+        uses: codecov/codecov-action@v2
+        with:
+          token: ${{secrets.CODECOV_TOKEN}}
+          fail_ci_if_error: true

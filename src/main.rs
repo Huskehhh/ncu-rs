@@ -109,6 +109,7 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
+/// Helper function to await all dep futures and update the progress bar according to progress.
 async fn await_futures(
     futures: Vec<JoinHandle<Option<PackageUpdateData>>>,
     progress_bar: &mut ProgressBar<Stdout>,
@@ -124,6 +125,8 @@ async fn await_futures(
     Ok(())
 }
 
+/// Processes all dependencies in the given map. Returns a Vec containing a JoinHandle to the task
+/// for each dependency.
 async fn process_dependencies(
     deps: &HashMap<String, String>,
     dev: bool,
@@ -172,6 +175,7 @@ async fn process_dependencies(
     futures
 }
 
+/// Gets the latest version of a package via the NPM registry API.
 async fn get_package_version(package_name: &str) -> Result<String, Error> {
     let url = format!("{}/{}/latest", API_URL, package_name);
 
@@ -183,6 +187,7 @@ async fn get_package_version(package_name: &str) -> Result<String, Error> {
     Ok(resp.version)
 }
 
+/// Inserts new dependencies into the given package_json serde::Value.
 pub fn insert_new_maps(
     package_json: &mut Value,
     deps: HashMap<String, String>,
@@ -196,4 +201,66 @@ pub fn insert_new_maps(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_insert_new_maps() {
+        let mut package_json = json!({
+            "name": "abc123",
+            "dependencies": {
+                "package-a": "^1.0.0",
+                "package-b": "^2.0.0",
+            },
+            "devDependencies": {
+                "package-c": "^3.0.0",
+                "package-d": "^4.0.0",
+            }
+        });
+
+        let mut deps: HashMap<String, String> = HashMap::new();
+        deps.insert("package-a".to_string(), "^2.0.0".to_string());
+        deps.insert("package-b".to_string(), "^3.0.0".to_string());
+
+        let mut dev_deps: HashMap<String, String> = HashMap::new();
+        dev_deps.insert("package-c".to_string(), "^3.5.0".to_string());
+        dev_deps.insert("package-d".to_string(), "^4.0.0".to_string());
+
+        // Expect the new maps to be inserted into the package.json file.
+        let result = insert_new_maps(&mut package_json, deps, dev_deps);
+        assert!(result.is_ok());
+        assert_eq!(
+            package_json,
+            json!({
+                "name": "abc123",
+                "dependencies": {
+                    "package-a": "^2.0.0",
+                    "package-b": "^3.0.0",
+                },
+                "devDependencies": {
+                    "package-c": "^3.5.0",
+                    "package-d": "^4.0.0",
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_package_version() {
+        let package = "react";
+        let package_version = get_package_version(package).await;
+        assert!(package_version.is_ok());
+        assert_ne!(package_version.unwrap(), "0.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_get_package_version_non_existant() {
+        let package = "non-existant-package_lol_123123";
+        let package_version = get_package_version(package).await;
+        assert!(package_version.is_err());
+    }
 }
