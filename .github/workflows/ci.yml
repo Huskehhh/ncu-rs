@@ -19,7 +19,7 @@ jobs:
           working-directory: .
       - uses: extractions/setup-just@v1
       - name: Install tarpaulin
-        run: cargo install cargo-tarpaulin
+        run: bash <(curl https://raw.githubusercontent.com/xd009642/tarpaulin/master/travis-install.sh)
       - name: Build
         run: just check
       - name: Run tests
