@@ -1,11 +1,12 @@
 use clap::{arg, command};
 use color_eyre::eyre::Error;
+use indexmap::IndexMap;
 use pbr::ProgressBar;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 
-use std::{collections::HashMap, fs, io::Stdout, time::Instant};
+use std::{fs, io::Stdout, time::Instant};
 
 const API_URL: &str = "https://registry.npmjs.org/";
 const DEP_KEY: &str = "dependencies";
@@ -47,8 +48,8 @@ async fn main() -> Result<(), Error> {
     let deps = package_json.get(DEP_KEY).unwrap();
     let dev_deps = package_json.get(DEV_DEP_KEY).unwrap();
 
-    let mut deps: HashMap<String, String> = serde_json::from_value(deps.clone())?;
-    let mut dev_deps: HashMap<String, String> = serde_json::from_value(dev_deps.clone())?;
+    let mut deps: IndexMap<String, String> = serde_json::from_value(deps.clone())?;
+    let mut dev_deps: IndexMap<String, String> = serde_json::from_value(dev_deps.clone())?;
 
     let dep_count = (deps.len() + dev_deps.len()) as u64;
 
@@ -128,7 +129,7 @@ async fn await_futures(
 /// Processes all dependencies in the given map. Returns a Vec containing a JoinHandle to the task
 /// for each dependency.
 async fn process_dependencies(
-    deps: &HashMap<String, String>,
+    deps: &IndexMap<String, String>,
     dev: bool,
 ) -> Vec<tokio::task::JoinHandle<Option<PackageUpdateData>>> {
     let futures: Vec<_> = deps
@@ -190,8 +191,8 @@ async fn get_package_version(package_name: &str) -> Result<String, Error> {
 /// Inserts new dependencies into the given package_json serde::Value.
 pub fn insert_new_maps(
     package_json: &mut Value,
-    deps: HashMap<String, String>,
-    dev_deps: HashMap<String, String>,
+    deps: IndexMap<String, String>,
+    dev_deps: IndexMap<String, String>,
 ) -> Result<(), Error> {
     if let Some(deps_value) = package_json.get_mut(DEP_KEY) {
         *deps_value = serde_json::to_value(deps)?;
@@ -222,11 +223,11 @@ mod tests {
             }
         });
 
-        let mut deps: HashMap<String, String> = HashMap::new();
+        let mut deps: IndexMap<String, String> = IndexMap::new();
         deps.insert("package-a".to_string(), "^2.0.0".to_string());
         deps.insert("package-b".to_string(), "^3.0.0".to_string());
 
-        let mut dev_deps: HashMap<String, String> = HashMap::new();
+        let mut dev_deps: IndexMap<String, String> = IndexMap::new();
         dev_deps.insert("package-c".to_string(), "^3.5.0".to_string());
         dev_deps.insert("package-d".to_string(), "^4.0.0".to_string());
 
@@ -266,7 +267,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_dependencies_and_await_futures() {
-        let mut deps: HashMap<String, String> = HashMap::new();
+        let mut deps: IndexMap<String, String> = IndexMap::new();
         deps.insert("react".to_string(), "^2.0.0".to_string());
         deps.insert("recoil".to_string(), "~3.0.0".to_string());
 
