@@ -1,12 +1,21 @@
 use clap::{arg, command};
 use color_eyre::eyre::Error;
+use futures::Future;
 use indexmap::IndexMap;
-use pbr::ProgressBar;
+use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
+use std::{
+    fs,
+    time::{Duration, Instant},
+};
 use tokio::task::JoinHandle;
 
-use std::{fs, io::Stdout, time::Instant};
+use tracing_subscriber::{
+    prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry,
+};
+use tracing_tree::HierarchicalLayer;
 
 const API_URL: &str = "https://registry.npmjs.org/";
 const DEP_KEY: &str = "dependencies";
@@ -25,9 +34,27 @@ struct PackageUpdateData {
     dev: bool,
 }
 
+fn make_client() -> Client {
+    Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .expect("Failed to build client")
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let start = Instant::now();
+
+    let client = make_client();
+
+    Registry::default()
+        .with(EnvFilter::from_default_env())
+        .with(
+            HierarchicalLayer::new(2)
+                .with_targets(true)
+                .with_bracketed_fields(true),
+        )
+        .init();
 
     let matches = command!()
         .arg(arg!([path] "Optional path to package.json"))
@@ -51,19 +78,8 @@ async fn main() -> Result<(), Error> {
     let mut deps: IndexMap<String, String> = serde_json::from_value(deps.clone())?;
     let mut dev_deps: IndexMap<String, String> = serde_json::from_value(dev_deps.clone())?;
 
-    let dep_count = (deps.len() + dev_deps.len()) as u64;
-
-    let dep_futures = process_dependencies(&deps, false).await;
-    let dev_dep_futures = process_dependencies(&dev_deps, true).await;
-
-    let mut updates = vec![];
-    let mut pb = ProgressBar::new(dep_count);
-
-    pb.show_speed = false;
-    pb.show_time_left = false;
-
-    await_futures(dep_futures, &mut pb, &mut updates).await?;
-    await_futures(dev_dep_futures, &mut pb, &mut updates).await?;
+    let dep_futures = process_dependencies(&client, &deps, false);
+    let dev_dep_futures = process_dependencies(&client, &dev_deps, true);
 
     let mut did_update_packages = false;
     for update in updates {
@@ -112,13 +128,11 @@ async fn main() -> Result<(), Error> {
 
 /// Helper function to await all dep futures and update the progress bar according to progress.
 async fn await_futures(
-    futures: Vec<JoinHandle<Option<PackageUpdateData>>>,
-    progress_bar: &mut ProgressBar<Stdout>,
+    futures: Vec<impl Future<Output = Option<PackageUpdateData>>>,
     updates_vec: &mut Vec<PackageUpdateData>,
 ) -> Result<(), Error> {
     for future in futures {
-        progress_bar.inc();
-        let val = future.await?;
+        let val = future.await;
         if let Some(update) = val {
             updates_vec.push(update);
         }
@@ -129,58 +143,65 @@ async fn await_futures(
 /// Processes all dependencies in the given map. Returns a Vec containing a JoinHandle to the task
 /// for each dependency.
 async fn process_dependencies(
+    client: &Client,
     deps: &IndexMap<String, String>,
     dev: bool,
-) -> Vec<tokio::task::JoinHandle<Option<PackageUpdateData>>> {
-    let futures: Vec<_> = deps
-        .iter()
-        .map(
-            |(package_name, version)| -> tokio::task::JoinHandle<Option<PackageUpdateData>> {
-                let package_name = package_name.clone();
-                let version = version.clone();
+) -> Vec<PackageUpdateData> {
+    let mut updates = vec![];
+    let mut update_dest = vec![];
 
-                tokio::spawn(async move {
-                    let cmp_ver = version.replace('^', "").replace('~', "");
-                    let ver_prefix = if version.contains('^') {
-                        "^"
-                    } else if version.contains('~') {
-                        "~"
-                    } else {
-                        ""
-                    };
+    deps.par_iter().for_each(|(package_name, version)| {
+        let update = compare_package_version(client, version.clone(), package_name.clone(), dev);
+    });
 
-                    match get_package_version(&package_name).await {
-                        Ok(latest_version) => {
-                            if latest_version != cmp_ver {
-                                let package_update_data = PackageUpdateData {
-                                    package_name,
-                                    old_version: version,
-                                    new_version: format!("{}{}", ver_prefix, latest_version),
-                                    dev,
-                                };
+    await_futures(updates, &mut update_dest).await;
 
-                                return Some(package_update_data);
-                            }
-                        }
-                        Err(err) => {
-                            println!("Error when fetching {package_name} version, {err}");
-                        }
-                    };
+    update_dest
+}
 
-                    None
-                })
-            },
-        )
-        .collect();
+async fn compare_package_version(
+    client: &Client,
+    version: String,
+    package_name: String,
+    dev: bool,
+) -> Option<PackageUpdateData> {
+    let cmp_ver = version.replace('^', "").replace('~', "");
+    let ver_prefix = if version.contains('^') {
+        "^"
+    } else if version.contains('~') {
+        "~"
+    } else {
+        ""
+    };
 
-    futures
+    match get_package_version(client, &package_name).await {
+        Ok(latest_version) => {
+            if latest_version != cmp_ver {
+                let package_update_data = PackageUpdateData {
+                    package_name,
+                    old_version: version,
+                    new_version: format!("{}{}", ver_prefix, latest_version),
+                    dev,
+                };
+
+                return Some(package_update_data);
+            }
+        }
+        Err(err) => {
+            println!("Error when fetching {package_name} version, {err}");
+        }
+    };
+
+    None
 }
 
 /// Gets the latest version of a package via the NPM registry API.
-async fn get_package_version(package_name: &str) -> Result<String, Error> {
+async fn get_package_version(client: &Client, package_name: &str) -> Result<String, Error> {
     let url = format!("{}/{}/latest", API_URL, package_name);
 
-    let resp = reqwest::get(&url)
+    let resp = client
+        .get(&url)
+        .send()
         .await?
         .json::<GetPackageResponse>()
         .await?;
@@ -253,38 +274,33 @@ mod tests {
     #[tokio::test]
     async fn test_get_package_version() {
         let package = "react";
-        let package_version = get_package_version(package).await;
+        let package_version = get_package_version(&client, package).await;
         assert!(package_version.is_ok());
         assert_ne!(package_version.unwrap(), "0.0.0");
     }
 
     #[tokio::test]
     async fn test_get_package_version_non_existant() {
+        let client = make_client();
         let package = "non-existant-package_lol_123123";
-        let package_version = get_package_version(package).await;
+        let package_version = get_package_version(&client, package).await;
         assert!(package_version.is_err());
     }
 
     #[tokio::test]
     async fn test_process_dependencies_and_await_futures() {
+        let client = make_client();
+
         let mut deps: IndexMap<String, String> = IndexMap::new();
         deps.insert("react".to_string(), "^2.0.0".to_string());
         deps.insert("recoil".to_string(), "~3.0.0".to_string());
 
-        let futures = process_dependencies(&deps, false).await;
+        let futures = process_dependencies(&client, &deps, false);
         assert_eq!(futures.len(), 2);
-
-        let mut pb = ProgressBar::new(2);
-        pb.show_bar = false;
-        pb.show_counter = false;
-        pb.show_message = false;
-        pb.show_percent = false;
-        pb.show_time_left = false;
-        pb.show_speed = false;
 
         let mut updates_vec: Vec<PackageUpdateData> = vec![];
 
-        let futures = await_futures(futures, &mut pb, &mut updates_vec).await;
+        let futures = await_futures(futures, &mut updates_vec).await;
         assert!(futures.is_ok());
 
         for update in updates_vec {
