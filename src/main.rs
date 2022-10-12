@@ -1,14 +1,23 @@
 use clap::{arg, command};
 use color_eyre::eyre::Error;
 use indexmap::IndexMap;
-use pbr::ProgressBar;
+use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::task::JoinHandle;
+use std::{
+    fs,
+    time::{Duration, Instant},
+};
+use tokio::sync::OnceCell;
 
-use std::{fs, io::Stdout, time::Instant};
+use tracing_subscriber::{
+    prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry,
+};
+use tracing_tree::HierarchicalLayer;
 
-const API_URL: &str = "https://registry.npmjs.org/";
+static CLIENT: OnceCell<Client> = OnceCell::const_new();
+
+const API_URL: &str = "https://registry.npmjs.org";
 const DEP_KEY: &str = "dependencies";
 const DEV_DEP_KEY: &str = "devDependencies";
 
@@ -22,12 +31,31 @@ struct PackageUpdateData {
     package_name: String,
     old_version: String,
     new_version: String,
-    dev: bool,
+}
+
+async fn make_client() -> Client {
+    Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap()
+}
+
+async fn get_client() -> &'static Client {
+    CLIENT.get_or_init(make_client).await
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let start = Instant::now();
+
+    Registry::default()
+        .with(EnvFilter::from_default_env())
+        .with(
+            HierarchicalLayer::new(2)
+                .with_targets(true)
+                .with_bracketed_fields(true),
+        )
+        .init();
 
     let matches = command!()
         .arg(arg!([path] "Optional path to package.json"))
@@ -51,37 +79,11 @@ async fn main() -> Result<(), Error> {
     let mut deps: IndexMap<String, String> = serde_json::from_value(deps.clone())?;
     let mut dev_deps: IndexMap<String, String> = serde_json::from_value(dev_deps.clone())?;
 
-    let dep_count = (deps.len() + dev_deps.len()) as u64;
+    let dep_updates = process_dependencies(&deps).await;
+    let dev_dep_updates = process_dependencies(&dev_deps).await;
 
-    let dep_futures = process_dependencies(&deps, false).await;
-    let dev_dep_futures = process_dependencies(&dev_deps, true).await;
-
-    let mut updates = vec![];
-    let mut pb = ProgressBar::new(dep_count);
-
-    pb.show_speed = false;
-    pb.show_time_left = false;
-
-    await_futures(dep_futures, &mut pb, &mut updates).await?;
-    await_futures(dev_dep_futures, &mut pb, &mut updates).await?;
-
-    let mut did_update_packages = false;
-    for update in updates {
-        did_update_packages = true;
-        println!(
-            "{}     {} => {}",
-            update.package_name, update.old_version, update.new_version
-        );
-
-        // If we should update the package.json file, update the relevant map.
-        if should_update {
-            if update.dev {
-                dev_deps.insert(update.package_name, update.new_version);
-            } else {
-                deps.insert(update.package_name, update.new_version);
-            }
-        }
-    }
+    let did_update_pkgs = build_updates(dep_updates, should_update, &mut deps).await;
+    let did_update_dev_pkgs = build_updates(dev_dep_updates, should_update, &mut dev_deps).await;
 
     // Finally, merge the newly updated versions into the previous value struct.
     if should_update {
@@ -91,7 +93,7 @@ async fn main() -> Result<(), Error> {
         let package_file_contents = serde_json::to_string_pretty(&package_json)?;
         fs::write(&path, package_file_contents)?;
 
-        if did_update_packages {
+        if did_update_pkgs || did_update_dev_pkgs {
             println!(
                 "Updated {}. Please install the updated packages. (npm/yarn/pnpm install)!",
                 path
@@ -110,77 +112,86 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
-/// Helper function to await all dep futures and update the progress bar according to progress.
-async fn await_futures(
-    futures: Vec<JoinHandle<Option<PackageUpdateData>>>,
-    progress_bar: &mut ProgressBar<Stdout>,
-    updates_vec: &mut Vec<PackageUpdateData>,
-) -> Result<(), Error> {
-    for future in futures {
-        progress_bar.inc();
-        let val = future.await?;
-        if let Some(update) = val {
-            updates_vec.push(update);
-        }
-    }
-    Ok(())
-}
-
 /// Processes all dependencies in the given map. Returns a Vec containing a JoinHandle to the task
 /// for each dependency.
-async fn process_dependencies(
-    deps: &IndexMap<String, String>,
-    dev: bool,
-) -> Vec<tokio::task::JoinHandle<Option<PackageUpdateData>>> {
-    let futures: Vec<_> = deps
-        .iter()
-        .map(
-            |(package_name, version)| -> tokio::task::JoinHandle<Option<PackageUpdateData>> {
-                let package_name = package_name.clone();
-                let version = version.clone();
+async fn process_dependencies(deps: &IndexMap<String, String>) -> Vec<Option<PackageUpdateData>> {
+    let mut updates = vec![];
 
-                tokio::spawn(async move {
-                    let cmp_ver = version.replace('^', "").replace('~', "");
-                    let ver_prefix = if version.contains('^') {
-                        "^"
-                    } else if version.contains('~') {
-                        "~"
-                    } else {
-                        ""
-                    };
+    for (package_name, version) in deps {
+        let update = compare_package_version(version.clone(), package_name.clone()).await;
+        updates.push(update);
+    }
 
-                    match get_package_version(&package_name).await {
-                        Ok(latest_version) => {
-                            if latest_version != cmp_ver {
-                                let package_update_data = PackageUpdateData {
-                                    package_name,
-                                    old_version: version,
-                                    new_version: format!("{}{}", ver_prefix, latest_version),
-                                    dev,
-                                };
+    updates
+}
 
-                                return Some(package_update_data);
-                            }
-                        }
-                        Err(err) => {
-                            println!("Error when fetching {package_name} version, {err}");
-                        }
-                    };
+async fn build_updates(
+    updates: Vec<Option<PackageUpdateData>>,
+    should_update: bool,
+    dest: &mut IndexMap<String, String>,
+) -> bool {
+    let mut did_update_packages = false;
 
-                    None
-                })
-            },
-        )
-        .collect();
+    updates.into_iter().for_each(|update| {
+        if let Some(update) = update {
+            println!(
+                "{}     {} => {}",
+                update.package_name, update.old_version, update.new_version
+            );
 
-    futures
+            // If we should update the package.json file, update the relevant map.
+            if should_update {
+                dest.insert(update.package_name, update.new_version);
+            }
+
+            did_update_packages = true;
+        }
+    });
+
+    did_update_packages
+}
+
+async fn compare_package_version(
+    version: String,
+    package_name: String,
+) -> Option<PackageUpdateData> {
+    let client = get_client().await;
+    let cmp_ver = version.replace('^', "").replace('~', "");
+    let ver_prefix = if version.contains('^') {
+        "^"
+    } else if version.contains('~') {
+        "~"
+    } else {
+        ""
+    };
+
+    match get_package_version(client, &package_name).await {
+        Ok(latest_version) => {
+            if latest_version != cmp_ver {
+                let package_update_data = PackageUpdateData {
+                    package_name,
+                    old_version: version,
+                    new_version: format!("{}{}", ver_prefix, latest_version),
+                };
+
+                return Some(package_update_data);
+            }
+        }
+        Err(err) => {
+            println!("Error when fetching {package_name} version, {err}");
+        }
+    };
+
+    None
 }
 
 /// Gets the latest version of a package via the NPM registry API.
-async fn get_package_version(package_name: &str) -> Result<String, Error> {
+async fn get_package_version(client: &Client, package_name: &str) -> Result<String, Error> {
     let url = format!("{}/{}/latest", API_URL, package_name);
 
-    let resp = reqwest::get(&url)
+    let resp = client
+        .get(&url)
+        .send()
         .await?
         .json::<GetPackageResponse>()
         .await?;
@@ -252,16 +263,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_package_version() {
+        let client = make_client().await;
         let package = "react";
-        let package_version = get_package_version(package).await;
+        let package_version = get_package_version(&client, package).await;
         assert!(package_version.is_ok());
         assert_ne!(package_version.unwrap(), "0.0.0");
     }
 
     #[tokio::test]
     async fn test_get_package_version_non_existant() {
+        let client = make_client().await;
         let package = "non-existant-package_lol_123123";
-        let package_version = get_package_version(package).await;
+        let package_version = get_package_version(&client, package).await;
         assert!(package_version.is_err());
     }
 
@@ -271,32 +284,21 @@ mod tests {
         deps.insert("react".to_string(), "^2.0.0".to_string());
         deps.insert("recoil".to_string(), "~3.0.0".to_string());
 
-        let futures = process_dependencies(&deps, false).await;
-        assert_eq!(futures.len(), 2);
+        let updates = process_dependencies(&deps).await;
+        assert_eq!(updates.len(), 2);
 
-        let mut pb = ProgressBar::new(2);
-        pb.show_bar = false;
-        pb.show_counter = false;
-        pb.show_message = false;
-        pb.show_percent = false;
-        pb.show_time_left = false;
-        pb.show_speed = false;
-
-        let mut updates_vec: Vec<PackageUpdateData> = vec![];
-
-        let futures = await_futures(futures, &mut pb, &mut updates_vec).await;
-        assert!(futures.is_ok());
-
-        for update in updates_vec {
-            if update.package_name == "react" {
-                assert_eq!(update.old_version, "^2.0.0");
-                assert_ne!(update.old_version, update.new_version);
-            } else if update.package_name == "recoil" {
-                assert_eq!(update.old_version, "~3.0.0");
-                assert_ne!(update.old_version, update.new_version);
-            } else {
-                panic!("Unexpected package name: {}", update.package_name);
+        updates.into_iter().for_each(|update| {
+            if let Some(update) = update {
+                if update.package_name == "react" {
+                    assert_eq!(update.old_version, "^2.0.0");
+                    assert_ne!(update.old_version, update.new_version);
+                } else if update.package_name == "recoil" {
+                    assert_eq!(update.old_version, "~3.0.0");
+                    assert_ne!(update.old_version, update.new_version);
+                } else {
+                    panic!("Unexpected package name: {}", update.package_name);
+                }
             }
-        }
+        });
     }
 }
